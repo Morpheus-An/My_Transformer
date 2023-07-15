@@ -127,13 +127,13 @@ class encoder(nn.Module):
         self.attn = MutiAtten(ndim, h, drop_v)
         self.feedforward = fdfwd(ndim, ndim_hidden, drop_v)
 
-        self.layernorm0 = LayerNorm(ndim)
+        # self.layernorm0 = LayerNorm(ndim)
         self.layernorm1 = LayerNorm(ndim)
         self.layernorm2 = LayerNorm(ndim)
         self.dropout = nn.Dropout(drop_v)
     
     def forward(self, x):
-        x = self.layernorm0(x) #! 为了de一个bug，加上一个层归一化
+        # x = self.layernorm0(x) #! 为了de一个bug，加上一个层归一化
         x = x + self.dropout(self.attn(x))
         x = self.layernorm1(x)
         x = x + self.dropout(self.feedforward(x))
@@ -149,7 +149,7 @@ class decoder(nn.Module):
         self.feedforward = fdfwd(ndim, ndim_hidden, drop_v)
         self.dropout =nn.Dropout()
         
-        self.layernorm0 = LayerNorm(ndim) #!debug
+        # self.layernorm0 = LayerNorm(ndim) #!debug
         self.layernorm1 = LayerNorm(ndim)
         self.layernorm2 = LayerNorm(ndim)
         self.layernorm3 = LayerNorm(ndim)
@@ -157,7 +157,7 @@ class decoder(nn.Module):
 
 
     def forward(self, x, preinput):
-        x = self.layernorm0(x) #! 同上
+        # x = self.layernorm0(x) #! 同上
         x = x + self.dropout(self.selfattn(x))
         x = self.layernorm1(x)
         x = x + self.dropout(self.crossattn(x, preinput))
@@ -208,6 +208,7 @@ class MYTransformer(nn.Module):
         return self.decode(self.encode(x), preinput)
 
     def generate(self, x):
+        """生成最终的概率"""
         return self.generator(x)
 
 def inference_test():
@@ -216,19 +217,19 @@ def inference_test():
         if p.dim() > 1:
             nn.init.xavier_uniform_(p)
     model.eval()
-    src = torch.LongTensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
-    preinput = model.encode(src)
+    src = torch.LongTensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]]) # (1, 10)
+    preinput = model.encode(src) # (1, 10, 512)
     preout = torch.zeros(1, 1).type_as(src)
     for i in range(9):
-        out = model.decode(preout, preinput)
-        prob = model.generate(out[:,-1])
+        out = model.decode(preout, preinput)  # (1, 1, 512) --> (1, 2, 512) --> ...
+        prob = model.generate(out[:,-1]) # (1, 11) 
         _, next_word = torch.max(prob, dim=1)
         next_word = next_word.data[0]
         preout = torch.cat([preout, torch.empty(1, 1).type_as(src.data).fill_(next_word)], dim=1)
     print("Example Untrained Model Prediction:", preout)
 
 
-    
+
 if __name__ == "__main__":
 
     def execute_inference_test(times):
