@@ -2,10 +2,29 @@ import torch
 import torch.nn as nn 
 from torch.nn import functional as F 
 import math
+def sequen_mask(X, valid_len, fill_value):
+    
+    maxlen = X.size(1)
+    mask = torch.arange((maxlen), dtype=torch.float32, device=X.device)[None, :] < valid_len[:, None]
+    X[~mask] = fill_value 
+    return X  
+
+def masked_softmax(X, valid_lens=None):
+    if valid_lens == None:
+        return F.softmax(X, dim=-1)
+    shape = X.shape 
+    if valid_lens.dim() == 1:
+        valid_lens = torch.repeat_interleave(valid_lens, X.shape[1])
+    else:
+        valid_lens = valid_lens.reshape(-1)
+    X = sequen_mask(X.reshape(-1, shape[-1]), valid_lens, -1e6)
+    return F.softmax(X.reshape(shape), dim=-1)
+
+
 class MutiAtten(nn.Module):
     """多头注意力层, 当forward的参数只有x时输入x.shape = (batch_size, len, ndim) out.shape = (batch_size, len, ndim)
     否则，输入k,q,v(batch_size, len, dim) --> out (batch_size, len, ndim)"""
-    def __init__(self, ndim, h, drop_v, masked_len=None, is_cross=False):
+    def __init__(self, ndim, h, drop_v, is_cross=False):
         super(MutiAtten, self).__init__()
         assert ndim % h == 0 
         # x.shape = (batch_size, len, ndim)
@@ -20,27 +39,23 @@ class MutiAtten(nn.Module):
 
         self.dropout = nn.Dropout(drop_v)
         # mask matrix(optional) #todo 初始化一个masked_len * masked_len 的掩码矩阵
-        if masked_len != None:
-            self.register_buffer("mask", torch.tril(torch.ones(masked_len, masked_len)).view(1, 1, masked_len, masked_len))
 
         self.h = h 
         self.ndim = ndim 
-        self.masked_len = masked_len
         self.atten = None
 
-    def forward(self, x, preinput=None):
-        batch_size, len, ndim = x.size() 
+    def forward(self, x, preinput, valid_lens):
+        batch_size, len, ndim = preinput.size() 
         # self attention:
-        if preinput == None:
-            k, q, v = self.x2kqv(x).split(self.ndim, dim=2) # shape = (batch_size, len, ndim)
+        if x == None:
+            k, q, v = self.x2kqv(preinput).split(self.ndim, dim=2) # shape = (batch_size, len, ndim)
 
             # shape --> (batch_size, h, len, ndim // h)
             for c in (k, q, v):
                 c = c.view(batch_size, len, self.h, -1).transpose(1, 2)
             atten_weight = (q @ k.transpose(-2, -1)) * (1.0 / (k.size(-1)**(0.5)))
-            if self.masked_len != None:
-                atten_weight = atten_weight.masked_fill(self.mask[:,:,:len,:len] == 0, float('-inf'))
-            atten_weight = F.softmax(atten_weight, dim=-1)
+
+            atten_weight = masked_softmax(atten_weight, valid_lens)
             atten_weight = self.dropout(atten_weight) # shape = (batch_size, h, len, len)
 
             out = atten_weight @ v # shape = (batch_size, h, len, ndim // h)
@@ -54,14 +69,12 @@ class MutiAtten(nn.Module):
         # todo cross attention:
         else:
             
-            q = self.wq(x).view(batch_size, -1, self.h, ndim // self.h).transpose(1, 2)
-            k = self.wk(preinput).view(batch_size, -1, self.h, ndim // self.h).transpose(1, 2)
-            v = self.wv(preinput).view(batch_size, -1, self.h, ndim // self.h).transpose(1, 2)
+            q = self.wq(preinput).view(batch_size, -1, self.h, ndim // self.h).transpose(1, 2)
+            k = self.wk(x).view(batch_size, -1, self.h, ndim // self.h).transpose(1, 2)
+            v = self.wv(x).view(batch_size, -1, self.h, ndim // self.h).transpose(1, 2)
             # shape = (batch_size, h, len, ndim // h)
-            atten_weight = (q @ k.transpose(-2, -1) * (1.0 / math.sqrt(k.size(-1)))) # (batch_size, h, len, len)
-            if self.masked_len != None:
-                atten_weight = atten_weight.masked_fill(self.mask[:,:,:len,:len] == 0, float('-inf'))
-            atten_weight = F.softmax(atten_weight, dim=-1)
+            atten_weight = (q @ k.transpose(-2, -1) * (1.0 / math.sqrt(k.size(-1)))) # (batch_size, h, lenq, lenk)
+            atten_weight = masked_softmax(atten_weight, valid_lens)
             atten_weight = self.dropout(atten_weight)
             out = atten_weight @ v 
             self.atten = atten_weight 
@@ -124,7 +137,7 @@ class encoder(nn.Module):
     """一个编码器块儿"""
     def __init__(self, drop_v, ndim, h, ndim_hidden):
         super(encoder, self).__init__()
-        self.attn = MutiAtten(ndim, h, drop_v)
+        self.attn = MutiAtten(ndim, h, drop_v, False)
         self.feedforward = fdfwd(ndim, ndim_hidden, drop_v)
 
         # self.layernorm0 = LayerNorm(ndim)
@@ -132,9 +145,9 @@ class encoder(nn.Module):
         self.layernorm2 = LayerNorm(ndim)
         self.dropout = nn.Dropout(drop_v)
     
-    def forward(self, x):
+    def forward(self, x, valid_len):
         # x = self.layernorm0(x) #! 为了de一个bug，加上一个层归一化
-        x = x + self.dropout(self.attn(x))
+        x = x + self.dropout(self.attn(None, x, valid_len))
         x = self.layernorm1(x)
         x = x + self.dropout(self.feedforward(x))
         x = self.layernorm2(x)
@@ -144,8 +157,8 @@ class decoder(nn.Module):
     """一个解码器块"""
     def __init__(self, ndim, h, drop_v, masked_len, ndim_hidden):
         super(decoder, self).__init__()
-        self.selfattn = MutiAtten(ndim, h, drop_v, masked_len)
-        self.crossattn = MutiAtten(ndim, h, drop_v, None, True)
+        self.selfattn = MutiAtten(ndim, h, drop_v, False)
+        self.crossattn = MutiAtten(ndim, h, drop_v, True)
         self.feedforward = fdfwd(ndim, ndim_hidden, drop_v)
         self.dropout =nn.Dropout()
         
@@ -156,15 +169,15 @@ class decoder(nn.Module):
 
 
 
-    def forward(self, x, preinput):
+    def forward(self, x, preinput, valid_len):
         # x = self.layernorm0(x) #! 同上
-        x = x + self.dropout(self.selfattn(x))
-        x = self.layernorm1(x)
-        x = x + self.dropout(self.crossattn(x, preinput))
-        x = self.layernorm2(x)
-        x = x + self.dropout(self.feedforward(x))
-        x = self.layernorm3(x)
-        return x 
+        preinput = preinput + self.dropout(self.selfattn(None, preinput, valid_len))
+        preinput = self.layernorm1(preinput)
+        preinput = preinput + self.dropout(self.crossattn(x, preinput, valid_len))
+        preinput = self.layernorm2(preinput)
+        preinput = preinput + self.dropout(self.feedforward(preinput))
+        preinput = self.layernorm3(preinput)
+        return preinput 
 
 class Generator(nn.Module):
     """最后的生成器部分"""
@@ -185,27 +198,29 @@ class MYTransformer(nn.Module):
         self.EncoderBlocks = nn.ModuleList([encoder(drop_v, ndim, h, ndim_hidden) for _ in range(num_layers)])
         # self.layernorm = LayerNorm(ndim)
         self.DecoderBlocks = nn.ModuleList([decoder(ndim, h, drop_v, masked_len, ndim_hidden) for _ in range(num_layers)])
+        self.dense = nn.Linear(ndim, vocab_tar)
         self.generator = Generator(ndim, vocab_tar)
-    def encode(self, x):
+    def encode(self, x, valid_lens):
         """接收的是尚未编码的向量"""
         # x.shape = (batch_size, len, ndim)
         for layer in self.prepros_inputlayer:
             x = layer(x)
         for layer in self.EncoderBlocks:
-            x = layer(x)
+            x = layer(x, valid_lens)
         return x 
 
-    def decode(self, x, preinput):
+    def decode(self, x, preinput, valid_lens):
         """同上"""
         for layer in self.prepros_outlayer:
-            x = layer(x)
+            preinput = layer(preinput)
         for layer in self.DecoderBlocks:
-            x = layer(x, preinput)
-        return x 
+            preinput = layer(x, preinput, valid_lens)
+        return preinput 
     
-    def forward(self, x, preinput):
+    def forward(self, x, preinput, enc_valid_lens, dec_valid_lens):
         """抛去generate的部分"""
-        return self.decode(self.encode(x), preinput)
+        out =  self.decode(self.encode(x, enc_valid_lens), preinput, dec_valid_lens)
+        return self.dense(out)
 
     def generate(self, x):
         """生成最终的概率"""
@@ -218,17 +233,16 @@ def inference_test():
             nn.init.xavier_uniform_(p)
     model.eval()
     src = torch.LongTensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]]) # (1, 10)
-    preinput = model.encode(src) # (1, 10, 512)
+    x = model.encode(src) # (1, 10, 512)
     preout = torch.zeros(1, 1).type_as(src)
     for i in range(9):
-        out = model.decode(preout, preinput)  # (1, 1, 512) --> (1, 2, 512) --> ...
+        out = model.decode(x, preout)  # (1, 1, 512) --> (1, 2, 512) --> ...
         prob = model.generate(out[:,-1]) # (1, 11) 
         _, next_word = torch.max(prob, dim=1)
         next_word = next_word.data[0]
         preout = torch.cat([preout, torch.empty(1, 1).type_as(src.data).fill_(next_word)], dim=1)
     print("Example Untrained Model Prediction:", preout)
-
-
+ 
 
 if __name__ == "__main__":
 
